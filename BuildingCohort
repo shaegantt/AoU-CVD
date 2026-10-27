@@ -1,0 +1,1024 @@
+# Project : Acute CVD + Fitbit (Methods section: data, definitions, study population)
+# Data: All of Us Controlled Tier v9 (C2025Q4R6)
+# Date: Oct.24.2026
+ 
+# ---- Install packages (only if missing) --------------------------------------
+# allofus (CRAN 1.3.0): community package by Smith & Cavanaugh (Northeastern
+# University; JAMIA 2024, doi:10.1093/jamia/ocae198). Not developed or endorsed
+# by the All of Us Research Program; used for the BigQuery connection
+# (aou_connect) and dplyr queries on the Researcher Workbench.
+ 
+# ---- Install packages (only if missing) --------------------------------------
+if (!requireNamespace("allofus", quietly = TRUE)) {
+  if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+  remotes::install_github("roux-ohdsi/allofus")
+}
+for (p in c("tidyr", "purrr", "ggplot2", "flextable", "data.table")) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+ 
+# Load packages
+library(allofus)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(flextable)
+ 
+con <- aou_connect()
+Sys.getenv("WORKSPACE_CDR")
+# Output: ...C2025Q4R6
+ 
+# Study Setting
+MIN_STEPS    <- 100                  	# valid day: >= 100 steps
+MIN_WEAR_MIN <- 600                  	# valid day: >= 10 h heart-rate data
+MAX_WEAR_MIN <- 1440                 	# valid day: <= 24 h
+STUDY_END    <- as.Date("2025-01-01")    # index date after Fitbit start and before data cutoff
+CASE_TOL     <- 7                    	# acute code <= 7 days before admission = same event
+AGE_MIN      <- 18
+EXP_WIN      <- c(7, 30)             	# exposure window: days -30 to -7
+REF_WIN      <- c(31, 90)            	# reference window: days -90 to -31
+MIN_EXP_DAYS <- 15                   	# valid days needed in exposure window
+MIN_REF_DAYS <- 20                   	# valid days needed in reference window
+FREE_AFTER   <- 90                   	# controls: no acute CVD through day +90
+ENC_LOOKBACK <- 365                  	# >= 1 EHR visit in the year before day 0
+N_CAND       <- 100                  	# controls sampled per risk set
+USE_SNOMED   <- TRUE                	# FALSE = ICD-sourced records only (cohort, prior CVD, outcome)
+set.seed(2026)
+ 
+viewer_table <- function(df, caption = NULL) {
+  flextable(df) |>
+    theme_booktabs() |>
+	font(fontname = "Arial", part = "all") |>
+	fontsize(size = 9, part = "all") |>
+	bold(part = "header") |>
+	valign(valign = "top", part = "body") |>
+    set_caption(caption) |>
+	autofit()
+}
+ 
+# AoU total ppl
+tbl(con, "person") |>
+  summarise(n = n_distinct(person_id)) |>
+  collect()
+# Output:747029
+ 
+# Check relevant variables
+grep("heart|sleep|activity|device|wear", DBI::dbListTables(con),
+ 	value = TRUE, ignore.case = TRUE)
+# Output: activity_summary, heart_rate_summary, heart_rate_intraday,
+#   sleep_daily_summary, sleep_daily_summary_ext, device, wear_study
+ 
+# Diagnosis records by source vocabulary
+src_coverage <- tbl(con, "condition_occurrence") |>
+  left_join(tbl(con, "concept") |>
+              select(condition_source_concept_id = concept_id, vocabulary_id),
+        	by = "condition_source_concept_id") |>
+  mutate(source_vocab = ifelse(is.na(vocabulary_id), "No source code", vocabulary_id)) |>
+  count(source_vocab) |>
+  collect() |>
+  mutate(n = as.numeric(n), pct = round(100 * n / sum(n), 1)) |>
+  arrange(desc(n))
+src_coverage
+# Output: ICD10CM 64.3% | ICD9CM 23.5% | No source code 6.3% | SNOMED 5.9%
+ 
+# Device program: BYOD vs. WEAR
+fitbit_span <- tbl(con, "activity_summary") |>
+  group_by(person_id) |>
+  summarise(fitbit_start = min(date, na.rm = TRUE),
+            fitbit_end   = max(date, na.rm = TRUE), .groups = "drop")
+ 
+fitbit_span |>
+  left_join(tbl(con, "wear_study") |> select(person_id, wear_consent_start_date),
+        	by = "person_id") |>
+  mutate(group = case_when(
+    is.na(wear_consent_start_date)         ~ "BYOD only",
+	fitbit_start < wear_consent_start_date ~ "BYOD first, then WEAR",
+	TRUE                               	~ "WEAR only")) |>
+  count(group) |>
+  collect() |>
+  mutate(n = as.numeric(n), pct = round(100 * n / sum(n), 1))
+# Output: BYOD only 49.9% | BYOD then WEAR 28.6% | WEAR only 21.5%
+ 
+ 
+ 
+# ICD Coding Checking
+icd_all <- tbl(con, "concept") |>
+  filter(vocabulary_id %in% c("ICD10CM", "ICD9CM")) |>
+  select(concept_id, vocabulary_id, concept_code, concept_name) |>
+  collect() |>
+  mutate(concept_id = as.numeric(concept_id))
+ 
+icd_all |> count(vocabulary_id)
+# Output:
+# ICD10CM 99,421
+# ICD9CM 17,564
+ 
+# Outcome: first acute CVD event
+acute_codes <- icd_all |>
+  mutate(group = case_when(
+	vocabulary_id == "ICD10CM" & grepl("^I2[12](\\.|$)", concept_code) ~ "acute_mi",
+	vocabulary_id == "ICD10CM" &
+      grepl("^I20\\.0$|^I25\\.(110|700|710|720|730|750|760|790)$", concept_code) ~ "unstable_angina",
+	vocabulary_id == "ICD10CM" & grepl("^I63(\\.|$)", concept_code) ~ "ischemic_stroke",
+	vocabulary_id == "ICD10CM" & grepl("^I61(\\.|$)", concept_code) ~ "ich",
+	vocabulary_id == "ICD10CM" &
+      grepl("^I50\\.(21|23|31|33|41|43|811|813)$", concept_code) ~ "acute_hf",
+	vocabulary_id == "ICD9CM" & grepl("^410\\.\\d[01]$", concept_code) ~ "acute_mi",
+	vocabulary_id == "ICD9CM" & grepl("^411\\.1$", concept_code) ~ "unstable_angina",
+	vocabulary_id == "ICD9CM" & grepl("^43[34]\\.\\d1|436", concept_code) ~ "ischemic_stroke",
+	vocabulary_id == "ICD9CM" & grepl("^431$", concept_code) ~ "ich",
+	vocabulary_id == "ICD9CM" & grepl("^428\\.(21|23|31|33|41|43)$", concept_code) ~ "acute_hf"
+  )) |>
+  filter(!is.na(group))
+acute_codes |> count(group, vocabulary_id)
+ 
+# Exclusion: prior CVD
+# Code list only (no people removed here). Step 4 removes anyone with any of
+# these codes BEFORE their Fitbit start; codes after Fitbit start are kept.
+base_codes <- icd_all |>
+  filter(
+    (vocabulary_id == "ICD10CM" &
+       grepl(paste0("^I2[0-5]|^I4[23]|^I48|^I50|^I09\\.81$|^I11\\.0$|",
+                    "^I13\\.[02]$|^I6[0-9]|^G4[56]|^I7[0-24]|^I73\\.9$|",
+                    "^Z86\\.73|^Z95\\.[15]|^Z98\\.61"), concept_code)) |
+      (vocabulary_id == "ICD9CM" &
+         grepl(paste0("^41[0-4]|^425|^427\\.3|^428|^43[0-8]|^44[0-24]|",
+                      "^443\\.9$|^V45\\.8[12]"), concept_code))) |>
+  filter(!concept_code %in% c("G45.4", "437.7")) # Transient Global Amnesia (TGA)
+base_codes |> count(vocabulary_id)
+# Output
+# ICD10CM 1,067
+# ICD9CM 253
+ 
+# Comorbidities
+comorb_codes <- icd_all |>
+  mutate(group = case_when(
+	vocabulary_id == "ICD10CM" & grepl("^E(0[89]|1[013])(\\.|$)", concept_code) ~ "diabetes",
+	vocabulary_id == "ICD9CM"  & grepl("^250", concept_code)                	~ "diabetes",
+	vocabulary_id == "ICD10CM" & grepl("^I1[0-6](\\.|$)|^I1A", concept_code)	~ "hypertension",
+	vocabulary_id == "ICD9CM"  & grepl("^40[1-5]", concept_code)            	~ "hypertension",
+	vocabulary_id == "ICD10CM" & grepl("^E78(\\.|$)", concept_code)         	~ "hyperlipidemia",
+	vocabulary_id == "ICD9CM"  & grepl("^272", concept_code)                	~ "hyperlipidemia",
+	vocabulary_id == "ICD10CM" & grepl("^N18(\\.|$)", concept_code)         	~ "ckd",
+	vocabulary_id == "ICD9CM"  & grepl("^585", concept_code)                	~ "ckd",
+	vocabulary_id == "ICD10CM" & grepl("^I48(\\.|$)", concept_code)         	~ "afib",
+	vocabulary_id == "ICD9CM"  & grepl("^427\\.3", concept_code)            	~ "afib",
+	vocabulary_id == "ICD10CM" & grepl("^I25(\\.|$)|^I20\\.[89]", concept_code) ~ "stable_cad",
+	vocabulary_id == "ICD9CM"  & grepl("^41[34]", concept_code)             	~ "stable_cad",
+	vocabulary_id == "ICD10CM" & grepl("^I70\\.2|^I73\\.9$", concept_code)  	~ "pad",
+	vocabulary_id == "ICD9CM"  & grepl("^440\\.2|^443\\.9$", concept_code)  	~ "pad"
+  )) |>
+  filter(!is.na(group))
+comorb_codes |> count(group, vocabulary_id)
+ 
+# Format/Compact ICD text
+icd_cat <- function(code) sub("\\..*$", "", code)
+ 
+format_codes <- function(ids, vocab) {
+  voc <- icd_all |> filter(vocabulary_id == vocab) |>
+	mutate(cat = icd_cat(concept_code))
+  sel <- voc |> filter(concept_id %in% ids)
+  if (nrow(sel) == 0) return("-")
+  leaves <- voc |> filter(concept_code != cat)
+  full <- leaves |> filter(cat %in% sel$cat) |>
+	group_by(cat) |>
+    summarise(full = all(concept_code %in% sel$concept_code), .groups = "drop")
+  sel <- sel |> left_join(full, by = "cat") |> mutate(full = coalesce(full, TRUE))
+ 
+  all_cats  <- sort(unique(voc$cat))
+  full_cats <- sort(unique(selcat[selfull]))
+  ranges <- character(0)
+  if (length(full_cats) > 0) {
+	grp <- cumsum(c(TRUE, diff(match(full_cats, all_cats)) != 1))
+	ranges <- tapply(seq_along(full_cats), grp, \(i)
+                     if (length(i) == 1) paste0(full_cats[i], ".x")
+                     else paste0(full_cats[min(i)], "-", full_cats[max(i)]))
+  }
+  part <- sel |> filter(!full, concept_code != cat) |>
+	mutate(sub = substr(concept_code, 1, nchar(cat) + 2))
+  sub_full <- leaves |>
+	mutate(sub = substr(concept_code, 1, nchar(cat) + 2)) |>
+	filter(sub %in% part$sub) |>
+	group_by(sub) |>
+    summarise(n_all = n(), all_in = all(concept_code %in% part$concept_code),
+              .groups = "drop")
+  part <- part |> left_join(sub_full, by = "sub")
+  part_txt <- sort(c(
+    sprintf("%sx", part |> filter(all_in, n_all > 1) |> distinct(sub) |> pull(sub)),
+	part |> filter(!(all_in & n_all > 1)) |> pull(concept_code)))
+  paste(c(unname(ranges), part_txt), collapse = ", ")
+}
+ 
+# Table: ICD definitions used in the analysis
+def_rows <- bind_rows(
+  acute_codes  |> mutate(section = "Outcome", 	variable = group),
+  base_codes   |> mutate(section = "Exclusion",   variable = "prior_cvd"),
+  comorb_codes |> mutate(section = "Comorbidity", variable = group)
+) |>
+  group_by(section, variable) |>
+  summarise(ids = list(concept_id), .groups = "drop") |>
+  mutate(section = factor(section, levels = c("Outcome", "Exclusion", "Comorbidity"))) |>
+  arrange(section) |>
+  mutate(section 	= as.character(section),
+         `ICD-10-CM` = map_chr(ids, \(x) format_codes(x, "ICD10CM")),
+         `ICD-9-CM`  = map_chr(ids, \(x) format_codes(x, "ICD9CM")),
+     	`N codes`   = map_int(ids, length))
+ 
+def_rows |>
+  select(Section = section, Variable = variable, `ICD-10-CM`, `ICD-9-CM`, `N codes`) |>
+  viewer_table("ICD code definitions used in the analysis") |>
+  width(j = 3:4, width = 3)
+ 
+# Supplementary Table 1: our ICD codes -> mapped SNOMED
+sup_codes <- bind_rows(
+  acute_codes  |> mutate(section = "Outcome"),
+  comorb_codes |> mutate(section = "Comorbidity"))
+ 
+icd_snomed <- tbl(con, "concept_relationship") |>
+  filter(relationship_id == "Maps to",
+         concept_id_1 %in% !!as.integer(sup_codes$concept_id)) |>
+  select(icd_id = concept_id_1, snomed_id = concept_id_2) |>
+  collect() |>
+  mutate(across(everything(), as.numeric)) |>
+  inner_join(sup_codes |> select(icd_id = concept_id, section, group),
+         	by = "icd_id", relationship = "many-to-many")
+ 
+# Keep only SNOMED concepts specific to each definition (drop broad concepts)
+comorb_specific <- comorb_codes |>
+  group_by(group) |>
+  reframe(snomed_id = as.numeric(map_to_snomed(concept_id)))
+icd_snomed <- icd_snomed |>
+  filter((section == "Outcome" & snomed_id %in% acute_snomed) |
+           (section == "Comorbidity" &
+              paste(group, snomed_id) %in% paste(comorb_specificgroup,comorbspecificsnomed_id)))
+ 
+snomed_info <- tbl(con, "concept") |>
+  filter(concept_id %in% !!as.integer(unique(icd_snomed$snomed_id))) |>
+  select(snomed_id = concept_id, snomed_name = concept_name) |>
+  collect() |>
+  mutate(snomed_id = as.numeric(snomed_id))
+ 
+# Within a group, hide concepts that are children of another mapped concept
+anc_pairs <- tbl(con, "concept_ancestor") |>
+  filter(ancestor_concept_id   %in% !!as.integer(snomed_info$snomed_id),
+         descendant_concept_id %in% !!as.integer(snomed_info$snomed_id),
+         min_levels_of_separation > 0) |>
+  select(anc_id = ancestor_concept_id, snomed_id = descendant_concept_id) |>
+  collect() |>
+  mutate(across(everything(), as.numeric))
+ 
+grp_sn <- icd_snomed |> count(section, group, snomed_id, name = "n_icd")
+ 
+child_of_other <- grp_sn |>
+  inner_join(anc_pairs, by = "snomed_id", relationship = "many-to-many") |>
+  semi_join(grp_sn, by = c("section", "group", "anc_id" = "snomed_id")) |>
+  distinct(section, group, snomed_id)
+ 
+snomed_txt <- grp_sn |>
+  anti_join(child_of_other, by = c("section", "group", "snomed_id")) |>
+  left_join(snomed_info, by = "snomed_id") |>
+  arrange(desc(n_icd)) |>
+  group_by(section, group) |>
+  summarise(SNOMED = paste0(snomed_name, " (", snomed_id, ")", collapse = "; "),
+            .groups = "drop")
+ 
+def_rows |>
+  filter(section %in% c("Outcome", "Comorbidity")) |>
+  left_join(snomed_txt, by = c("section", "variable" = "group")) |>
+  mutate(SNOMED = coalesce(SNOMED, "-")) |>
+  select(Section = section, Variable = variable, `ICD-10-CM`, `ICD-9-CM`,
+     	`SNOMED (mapped from our ICD codes)` = SNOMED) |>
+  viewer_table("Supplementary Table 1: ICD definitions and corresponding SNOMED concepts") |>
+  width(j = 3:5, width = 3)
+ 
+# All ICD -> SNOMED "Maps to" relationships
+icd_maps <- tbl(con, "concept_relationship") |>
+  filter(relationship_id == "Maps to") |>
+  inner_join(tbl(con, "concept") |>
+               filter(vocabulary_id %in% c("ICD10CM", "ICD9CM")) |>
+               select(concept_id_1 = concept_id),
+         	by = "concept_id_1") |>
+  select(icd_id = concept_id_1, snomed_id = concept_id_2) |>
+  collect() |>
+  mutate(across(everything(), as.numeric))
+ 
+# Keep only SNOMED concepts specific to our definition:
+# drop concepts that ICD codes outside the definition also map to
+map_to_snomed <- function(icd_ids) {
+  ours  <- icd_maps |> filter(icd_id %in% icd_ids)
+  other <- icd_maps |> filter(!icd_id %in% icd_ids)
+  setdiff(unique(ours$snomed_id), unique(other$snomed_id)) |> as.integer()
+}
+acute_snomed <- map_to_snomed(acute_codes$concept_id)
+base_snomed  <- map_to_snomed(base_codes$concept_id)
+c(acute = length(acute_snomed), base = length(base_snomed))
+# Output:
+# Output:
+# acute 47  
+# base  310
+ 
+# Records matching a definition: ICD-sourced -> our ICD list;
+# SNOMED / no source code -> exact mapped SNOMED concept
+cvd_records <- function(icd_ids, snomed_ids, use_snomed = USE_SNOMED) {
+  rec <- tbl(con, "condition_occurrence") |>
+    left_join(tbl(con, "concept") |>
+                select(condition_source_concept_id = concept_id, src_vocab = vocabulary_id),
+          	by = "condition_source_concept_id") |>
+	mutate(is_icd = coalesce(src_vocab, "none") %in% c("ICD10CM", "ICD9CM"))
+  if (!use_snomed) {
+	return(rec |> filter(condition_source_concept_id %in% !!as.integer(icd_ids)))
+  }
+  rec |>
+    filter(condition_source_concept_id %in% !!as.integer(icd_ids) |
+             (!is_icd & condition_concept_id %in% !!as.integer(snomed_ids)))
+}
+ 
+# Table: whole All of Us, ICD only vs. ICD + SNOMED (unique people)
+n_people <- function(icd_ids, snomed_ids, use_snomed) {
+  cvd_records(icd_ids, snomed_ids, use_snomed = use_snomed) |>
+	summarise(n = n_distinct(person_id)) |>
+	collect() |>
+	pull(n) |>
+	as.numeric()
+}
+ 
+aou_defs <- list(
+  "Acute CVD (outcome, any group)" = list(acute_codes$concept_id, acute_snomed),
+  "Prior CVD (exclusion)"      	= list(base_codes$concept_id,  base_snomed))
+ 
+aou_n <- tibble(
+  Definition 	= names(aou_defs),
+  `ICD only` 	= map_dbl(aou_defs, \(d) n_people(d[[1]], d[[2]], FALSE)),
+  `ICD + SNOMED` = map_dbl(aou_defs, \(d) n_people(d[[1]], d[[2]], TRUE)))
+ 
+aou_n |>
+  mutate(across(c(`ICD only`, `ICD + SNOMED`), \(x) format(x, big.mark = ","))) |>
+  viewer_table("All of Us participants with a CVD code (any setting, any date)")
+ 
+ 
+# Table: outcome codes with records in All of Us (ICD + SNOMED-sourced)
+outcome_code_use <- cvd_records(acute_codes$concept_id, acute_snomed, use_snomed = TRUE) |>
+  mutate(code_id = ifelse(is_icd, condition_source_concept_id, condition_concept_id)) |>
+  group_by(is_icd, code_id) |>
+  summarise(records = n(), people = n_distinct(person_id), .groups = "drop") |>
+  collect() |>
+  mutate(across(c(code_id, records, people), as.numeric))
+ 
+outcome_snomed <- icd_snomed |>
+  filter(section == "Outcome") |>
+  distinct(group, snomed_id) |>
+  left_join(snomed_info, by = "snomed_id")
+ 
+bind_rows(
+  acute_codes |>
+    left_join(outcome_code_use |> filter(is_icd), by = c("concept_id" = "code_id")) |>
+    transmute(group, Source = vocabulary_id, Code = concept_code,
+              Name = concept_name, records, people),
+  outcome_snomed |>
+    left_join(outcome_code_use |> filter(!is_icd), by = c("snomed_id" = "code_id")) |>
+    transmute(group, Source = "SNOMED (non-ICD source)", Code = as.character(snomed_id),
+              Name = snomed_name, records, people)) |>
+  mutate(Source = factor(Source, levels = c("ICD10CM", "ICD9CM", "SNOMED (non-ICD source)")),
+         across(c(records, people), \(x) format(coalesce(x, 0), big.mark = ","))) |>
+  arrange(group, Source, Code) |>
+  select(Group = group, Source, Code, Name, Records = records, People = people) |>
+  viewer_table("Acute CVD codes: records in All of Us (ICD and SNOMED-sourced)") |>
+  width(j = 4, width = 4)
+# Output file - Outcome Codes with Records in All of Us.pdf
+ 
+ 
+# Table: people per outcome group, by source
+people_by_source <- map_dfr(sort(unique(acute_codes$group)), \(g) {
+  cvd_records(acute_codesconceptid[acutecodesgroup == g],
+              unique(outcome_snomedsnomedid[outcomesnomedgroup == g]), use_snomed = TRUE) |>
+    group_by(person_id) |>
+    summarise(any_icd = max(ifelse(is_icd, 1L, 0L), na.rm = TRUE), .groups = "drop") |>
+    summarise(people = n(), icd = sum(any_icd), snomed_only = sum(1L - any_icd)) |>
+	collect() |>
+    mutate(across(everything(), as.numeric), group = g)
+})
+ 
+people_by_source |>
+  mutate(across(c(people, icd, snomed_only), \(x) format(x, big.mark = ","))) |>
+  select(Group = group, `People (any source)` = people, `With ICD record` = icd,
+         `SNOMED-sourced only` = snomed_only) |>
+  viewer_table("People with acute CVD codes in All of Us, by record source")
+ 
+ 
+ 
+# Fitbit valid days (>= 100 steps and 10-24 h of heart-rate data)
+steps_day <- tbl(con, "activity_summary") |>
+  select(person_id, fitbit_date = date, steps)
+ 
+wear_day <- tbl(con, "heart_rate_summary") |>
+  group_by(person_id, fitbit_date = date) |>
+  summarise(wear_min = sum(minute_in_zone, na.rm = TRUE), .groups = "drop")
+ 
+fitbit_day <- steps_day |>
+  left_join(wear_day, by = c("person_id", "fitbit_date"))
+ 
+# Check: person-days, participants, duplicates
+fitbit_day |>
+  summarise(person_days  = n(),
+            participants = n_distinct(person_id)) |>
+  collect()
+# Output: 68,072,723 person-days | 68,548 participants
+ 
+fitbit_day |>
+  count(person_id, fitbit_date) |>
+  filter(n > 1) |>
+  tally() |>
+  collect()
+# Output: 0 (no duplicate person-days)
+ 
+# Reasons for non-valid days
+fitbit_day |>
+  mutate(reason = case_when(
+    is.na(steps)          	~ "1. steps missing",
+    is.na(wear_min)       	~ "2. no heart-rate data",
+	steps < !!MIN_STEPS   	~ "3. steps < 100",
+	wear_min < !!MIN_WEAR_MIN ~ "4. wear < 10 h",
+	wear_min > !!MAX_WEAR_MIN ~ "5. wear > 24 h",
+	TRUE                  	~ "6. valid")) |>
+  count(reason) |>
+  arrange(reason) |>
+  collect() |>
+  mutate(n = as.numeric(n), pct = round(100 * n / sum(n), 1))
+ 
+# Figure: valid days under alternative thresholds (Plots)
+day_grid <- fitbit_day |>
+  mutate(wear_h	= floor(coalesce(wear_min, 0) / 60),
+         step_band = case_when(is.na(steps) ~ -1, steps < 100 ~ 0,
+                           	steps < 500 ~ 100, steps < 1000 ~ 500,
+                           	TRUE ~ 1000),
+         over_24h  = coalesce(wear_min, 0) > !!MAX_WEAR_MIN) |>
+  count(wear_h, step_band, over_24h) |>
+  collect() |>
+  mutate(n = as.numeric(n))
+ 
+heat <- expand.grid(min_wear_h = c(8, 10, 12), min_steps = c(0, 100, 500, 1000)) |>
+  rowwise() |>
+  mutate(pct = 100 * sum(day_grid$n[day_grid$wear_h >= min_wear_h &
+                                      day_grid$step_band >= min_steps &
+                                      !day_grid$over_24h]) / sum(day_grid$n)) |>
+  ungroup() |>
+  mutate(steps_lab = factor(paste0("≥ ", format(min_steps, big.mark = ",", trim = TRUE)),
+                            levels = paste0("≥ ", c("0", "100", "500", "1,000"))),
+         wear_lab  = factor(paste0(min_wear_h, "-24 h"), levels = paste0(c(12, 10, 8), "-24 h")),
+         chosen    = min_wear_h == 10 & min_steps == 100)
+ 
+ggplot(heat, aes(steps_lab, wear_lab, fill = pct)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_tile(data = subset(heat, chosen), fill = NA, colour = "black", linewidth = 1.2) +
+  geom_text(aes(label = sprintf("%.1f%%", pct)), size = 4.5) +
+  scale_fill_gradient(low = "#EFF3FF", high = "#6BAED6", guide = "none") +
+  labs(title = "Valid person-days under alternative thresholds",
+   	subtitle = "Black box = chosen definition",
+   	x = "Minimum steps per day", y = "Wear time") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(), plot.title = element_text(face = "bold"))
+ 
+valid_days <- fitbit_day |>
+  filter(steps >= !!MIN_STEPS, wear_min >= !!MIN_WEAR_MIN,
+     	wear_min <= !!MAX_WEAR_MIN) |>
+  select(person_id, fitbit_date, steps)
+ 
+valid_days |>
+  summarise(valid_days = n(),
+            people= n_distinct(person_id)) |>
+  collect()
+ 
+ 
+# Eligible participants
+people_valid_day <- valid_days |> distinct(person_id)
+people_with_ehr  <- tbl(con, "cb_search_person") |> filter(has_ehr_data == 1) |>
+  select(person_id)
+ 
+people_prior_cvd <- cvd_records(base_codes$concept_id, base_snomed) |>
+  select(person_id, condition_start_date) |>
+  inner_join(fitbit_span |> select(person_id, fitbit_start), by = "person_id") |>
+  filter(condition_start_date < fitbit_start) |>
+  distinct(person_id)
+ 
+# Population after each step (flowchart)
+pop_valid_fitbit     <- fitbit_span      	|> semi_join(people_valid_day, by = "person_id")
+pop_valid_fitbit_ehr <- pop_valid_fitbit 	|> semi_join(people_with_ehr,  by = "person_id")
+pop_no_prior_cvd     <- pop_valid_fitbit_ehr |> anti_join(people_prior_cvd, by = "person_id")
+ 
+# Death date (first record per person)
+death_dates <- tbl(con, "death") |>
+  group_by(person_id) |>
+  summarise(death_date = min(death_date, na.rm = TRUE), .groups = "drop")
+ 
+# Study population: download with birth and death dates
+study_pop <- pop_no_prior_cvd |>
+  left_join(tbl(con, "person") |> select(person_id, birth_datetime), by = "person_id") |>
+  left_join(death_dates, by = "person_id") |>
+  collect() |>
+  mutate(person_id	= as.numeric(person_id),
+         birth_date   = as.Date(birth_datetime),
+         fitbit_start = as.Date(fitbit_start),
+         fitbit_end   = as.Date(fitbit_end),
+         death_date   = as.Date(death_date)) |>
+  select(-birth_datetime)
+ 
+# Flowchart counts
+flow <- tibble(
+  step = c("All of Us participants", "Fitbit data", ">= 1 valid Fitbit day", "EHR data",
+           "No CVD before start of Fitbit data"),
+  n = c(tbl(con, "person")  |> tally() |> collect() |> pull(n),
+        fitbit_span      	|> tally() |> collect() |> pull(n),
+        pop_valid_fitbit 	|> tally() |> collect() |> pull(n),
+        pop_valid_fitbit_ehr |> tally() |> collect() |> pull(n),
+        nrow(study_pop))) |>
+  mutate(n = as.numeric(n))
+flow
+ 
+ 
+# Acute CVD records and outcome settings
+# First acute CVD code in any setting
+acute_any <- cvd_records(acute_codes$concept_id, acute_snomed) |>
+  semi_join(pop_no_prior_cvd , by = "person_id") |>
+  group_by(person_id) |>
+  summarise(first_acute_any = min(condition_start_date, na.rm = TRUE), .groups = "drop") |>
+  collect() |>
+  mutate(person_id = as.numeric(person_id), first_acute_any = as.Date(first_acute_any))
+ 
+study_pop <- study_pop |>
+  select(-any_of("first_acute_any")) |>
+  left_join(acute_any, by = "person_id")
+ 
+# Visit types: look up in the OMOP vocabulary
+# Standard visit concepts (Visit domain)
+visit_concepts <- tbl(con, "concept") |>
+  filter(domain_id == "Visit", standard_concept == "S") |>
+  select(concept_id, concept_name, vocabulary_id) |>
+  collect() |>
+  mutate(concept_id = as.integer(concept_id))
+ 
+visit_top <- visit_concepts |>
+  filter(concept_name %in% c("Inpatient Visit", "Emergency Room and Inpatient Visit",
+                         	"Emergency Room Visit", "Outpatient Visit"))
+visit_top
+ 
+ 
+id_of <- function(name) visit_top$concept_id[visit_top$concept_name == name]
+id_inpatient  <- c(id_of("Inpatient Visit"), id_of("Emergency Room and Inpatient Visit"))
+id_er         <- id_of("Emergency Room Visit")
+id_outpatient <- id_of("Outpatient Visit")
+ 
+# A visit type and all its descendants in the visit hierarchy
+with_descendants <- function(ids) {
+  tbl(con, "concept_ancestor") |>
+    filter(ancestor_concept_id %in% !!ids) |>
+    distinct(descendant_concept_id) |>
+	collect() |>
+    pull(descendant_concept_id) |>
+	as.integer() |>
+	union(ids)
+}
+ 
+inpt_types <- with_descendants(id_inpatient)
+outp_types <- with_descendants(id_outpatient)
+ 
+non_acute <- visit_concepts |>
+  filter(grepl("Psychiatr|Rehabilitation|Substance|Long Term|Nursery|Religious|Chronic Disease",
+               concept_name)) |>
+  pull(concept_id)
+inpt_types <- setdiff(inpt_types, non_acute)
+ 
+# Table: visit types counted as inpatient / ER / outpatient
+visit_use <- tbl(con, "visit_occurrence") |>
+  count(visit_concept_id, name = "visits") |>
+  collect() |>
+  mutate(across(everything(), as.numeric))
+ 
+visit_concepts |>
+  mutate(Setting = case_when(concept_id %in% inpt_types ~ "Inpatient",
+                         	concept_id %in% id_er  	~ "ER",
+                         	concept_id %in% outp_types ~ "Outpatient",
+                         	concept_id %in% non_acute  ~ "Excluded (non-acute facility)")) |>
+  filter(!is.na(Setting)) |>
+  left_join(visit_use, by = c("concept_id" = "visit_concept_id")) |>
+  mutate(visits 	= format(coalesce(visits, 0), big.mark = ","),
+         concept_id = as.character(concept_id)) |>
+  arrange(Setting, concept_id) |>
+  select(Setting, `Concept ID` = concept_id, `Visit type` = concept_name,
+     	`Visits in All of Us` = visits) |>
+  viewer_table("Visit types used to define the setting of acute CVD records")
+ 
+# Acute CVD records with source and setting
+acute_rec <- cvd_records(acute_codes$concept_id, acute_snomed) |>
+  semi_join(pop_no_prior_cvd, by = "person_id") |>
+  select(person_id, condition_start_date, visit_occurrence_id, is_icd) |>
+  left_join(tbl(con, "visit_occurrence") |>
+              select(visit_occurrence_id, visit_concept_id),
+        	by = "visit_occurrence_id") |>
+  collect() |>
+  mutate(across(c(person_id, visit_concept_id), as.numeric),
+         visit_occurrence_id  = as.character(visit_occurrence_id),
+         condition_start_date = as.Date(condition_start_date),
+         source  = ifelse(is_icd, "ICD", "SNOMED / no source"),
+     	setting = case_when(visit_concept_id %in% inpt_types ~ "inpatient",
+                         	visit_concept_id %in% id_er  	~ "ER",
+                         	visit_concept_id %in% outp_types ~ "outpatient",
+                         	TRUE                         	~ "other"))
+ 
+count_cases <- function(r) {
+  r |>
+    group_by(person_id) |>
+    summarise(index_date = min(condition_start_date), .groups = "drop") |>
+    inner_join(study_pop, by = "person_id") |>
+    filter(index_date > fitbit_start, index_date < STUDY_END,
+           first_acute_any >= index_date - CASE_TOL,
+           as.numeric(index_date - birth_date) / 365.25 >= AGE_MIN) |>
+	nrow()
+}
+ 
+two_codes <- function(r) {
+  r |>
+    distinct(person_id, condition_start_date, .keep_all = TRUE) |>
+    arrange(person_id, condition_start_date) |>
+    group_by(person_id) |>
+    filter(any(diff(condition_start_date) <= 30)) |>
+	ungroup()
+}
+ 
+# Count cases under each setting, ICD-sourced only vs. ICD + SNOMED-sourced
+compare_cases <- function(defs, caption) {
+  rec_icd <- acute_rec |> filter(source == "ICD")
+  tibble(Definition          	= names(defs),
+     	`Case found via ICD record`            = map_int(defs, \(f) count_cases(f(rec_icd))),
+         `Case found via ICD or SNOMED record`  = map_int(defs, \(f) count_cases(f(acute_rec)))) |>
+    mutate(across(-Definition, \(x) format(x, big.mark = ","))) |>
+    viewer_table(caption)
+}
+ 
+compare_cases(list(
+  "A. Inpatient / ER-to-inpatient (primary)"   = \(r) filter(r, setting == "inpatient"),
+  "B. A + ER only"                         	= \(r) filter(r, setting %in% c("inpatient", "ER")),
+  "C. Outpatient only"                         = \(r) filter(r, setting == "outpatient"),
+  "D. Any setting"                             = \(r) r,
+  "E. Any setting, >= 2 codes within 30 days"  = \(r) two_codes(r)),
+  "Cases under alternative outcome settings (before window rules)")
+
+# Table: setting of all acute CVD records (records, not people)
+acute_rec |>
+  count(Source = source, Setting = setting) |>
+  group_by(Source) |>
+  ungroup() |>
+  mutate(n = format(n, big.mark = ",")) |>
+  viewer_table("Acute CVD records in the study population, by source and visit setting")
+ 
+ 
+# Cases (primary: inpatient / ER-to-inpatient)
+acute_people <- as.integer(unique(acute_rec$person_id))
+ 
+# Inpatient stays of people with an acute CVD record
+inpt_visits <- tbl(con, "visit_occurrence") |>
+  filter(visit_concept_id %in% !!inpt_types, person_id %in% !!acute_people) |>
+  select(person_id, visit_occurrence_id, visit_start_date, visit_end_date) |>
+  collect() |>
+  mutate(person_id       	= as.numeric(person_id),
+         visit_occurrence_id = as.character(visit_occurrence_id),
+         visit_start_date	= as.Date(visit_start_date),
+         visit_end_date  	= as.Date(coalesce(visit_end_date, visit_start_date)))
+ 
+# Inpatient diagnoses matched by visit ID
+inpt_dx_by_visit_id <- acute_rec |>
+  inner_join(inpt_visits |> select(visit_occurrence_id, visit_start_date),
+         	by = "visit_occurrence_id", relationship = "many-to-many") |>
+  select(person_id, visit_start_date)
+ 
+# Inpatient diagnoses matched by date (records without a visit ID)
+inpt_dx_by_date <- acute_rec |>
+  filter(is.na(visit_occurrence_id)) |>
+  select(person_id, condition_start_date) |>
+  inner_join(inpt_visits, by = "person_id", relationship = "many-to-many") |>
+  filter(condition_start_date >= visit_start_date,
+         condition_start_date <= visit_end_date) |>
+  select(person_id, visit_start_date)
+ 
+# Index date = admission date of the first inpatient stay with an acute CVD diagnosis
+case_candidates <- bind_rows(inpt_dx_by_visit_id, inpt_dx_by_date) |>
+  group_by(person_id) |>
+  summarise(index_date = min(visit_start_date), .groups = "drop") |>
+  inner_join(study_pop, by = "person_id") |>
+  mutate(age_at_index	= as.numeric(index_date - birth_date) / 365.25,
+         ok_study_period = index_date > fitbit_start & index_date < STUDY_END,
+         ok_first_event  = first_acute_any >= index_date - CASE_TOL,
+         ok_adult    	= age_at_index >= AGE_MIN)
+ 
+cases <- case_candidates |>
+  filter(ok_study_period, ok_first_event, ok_adult) |>
+  mutate(set_id = row_number())   # one risk set per case
+ 
+# Number of cases left after each rule
+case_flow <- c(
+  hospitalized = nrow(case_candidates),
+  study_period = sum(case_candidates$ok_study_period),
+  first_event  = sum(case_candidatesokstudyperiod&casecandidatesok_first_event),
+  adult    	= nrow(cases))
+case_flow
+ 
+ 
+# Risk sets (controls)
+# Same index date as the case; alive, aged >= 18, Fitbit data covering the
+# windows, no acute CVD before day +90; random sample of each risk set
+control_candidates <- map_dfr(seq_len(nrow(cases)), \(i) {
+  case_index_date <- cases$index_date[i]
+  study_pop |>
+    filter(person_id != cases$person_id[i],                                	# not the case
+           as.numeric(case_index_date - birth_date) / 365.25 >= AGE_MIN,   	# adult on day 0
+           is.na(death_date) | death_date > case_index_date,               	# alive on day 0
+           fitbit_start <= case_index_date - REF_WIN[1],                   	# Fitbit before windows
+           fitbit_end   >= case_index_date - EXP_WIN[2],                   	# Fitbit still in use
+           is.na(first_acute_any) | first_acute_any > case_index_date + FREE_AFTER) |>  # event-free to day +90
+    slice_sample(n = N_CAND) |>
+    transmute(set_id = cases$set_id[i], person_id, index_date = case_index_date, case = 0L)
+})
+ 
+# Cases + control candidates: one row per person per risk set
+risk_set_members <- bind_rows(
+  cases |> transmute(set_id, person_id, index_date, case = 1L),
+  control_candidates) |>
+  mutate(member_id = row_number())
+ 
+c(rows = nrow(risk_set_members), people = n_distinct(risk_set_members$person_id))
+ 
+ 
+# Exposure / reference windows
+# Each person's records from (index - far) to (index - near) days
+window_join <- function(events, date_col, val_col, members, near, far) {
+  event_dates <- events |>
+    transmute(person_id, event_date = as.Date(.data[[date_col]]), val = .data[[val_col]])
+  windows <- members |>
+    transmute(member_id, person_id, index_date = as.Date(index_date),
+              win_start = index_date - far, win_end = index_date - near)
+  event_dates |>
+    inner_join(windows, by = join_by(person_id, between(event_date, win_start, win_end)),
+               relationship = "many-to-many") |>
+    transmute(member_id, days_before = as.integer(index_date - event_date), val)
+}
+ 
+# People in any risk set
+people_in_risk_sets <- as.integer(unique(risk_set_members$person_id))
+ 
+# Valid Fitbit days of these people, around the index dates
+member_valid_days <- valid_days |>
+  filter(person_id %in% !!people_in_risk_sets,
+         fitbit_date >= !!as.character(min(risk_set_members$index_date) - REF_WIN[2]),
+         fitbit_date <= !!as.character(max(risk_set_members$index_date))) |>
+  collect() |>
+  mutate(person_id = as.numeric(person_id), fitbit_date = as.Date(fitbit_date),
+     	steps = as.numeric(steps))
+ 
+# EHR visit days of these people, in the year before the index dates
+member_visits <- tbl(con, "visit_occurrence") |>
+  filter(person_id %in% !!people_in_risk_sets,
+         visit_start_date >= !!as.character(min(risk_set_members$index_date) - ENC_LOOKBACK),
+         visit_start_date <= !!as.character(max(risk_set_members$index_date))) |>
+  distinct(person_id, visit_start_date) |>
+  collect() |>
+  mutate(person_id = as.numeric(person_id), visit_start_date = as.Date(visit_start_date))
+ 
+# Valid days in the exposure and reference windows, per member
+window_valid_days <- window_join(member_valid_days, "fitbit_date", "steps", risk_set_members,
+                             	EXP_WIN[1], REF_WIN[2]) |>
+  group_by(member_id) |>
+  summarise(exposure_days  = sum(days_before <= EXP_WIN[2]),
+            reference_days = sum(days_before >= REF_WIN[1]), .groups = "drop")
+ 
+# EHR visit days in the year before the index date, per member
+prior_ehr_visits <- window_join(member_visits, "visit_start_date", "visit_start_date",
+                                risk_set_members, 1, ENC_LOOKBACK) |>
+  count(member_id, name = "prior_visits")
+ 
+# Window rules for each member
+window_check <- risk_set_members |>
+  left_join(window_valid_days, by = "member_id") |>
+  left_join(prior_ehr_visits,  by = "member_id") |>
+  mutate(across(c(exposure_days, reference_days, prior_visits), \(x) coalesce(as.numeric(x), 0)),
+         ok_exposure	= exposure_days  >= MIN_EXP_DAYS,
+         ok_reference   = reference_days >= MIN_REF_DAYS,
+         ok_prior_visit = prior_visits   >= 1,
+         ok_window  	= ok_exposure & ok_reference & ok_prior_visit) |>
+  group_by(set_id) |>
+  mutate(ok_has_control = any(case == 0 & ok_window)) |>
+  ungroup() |>
+  mutate(reason = case_when(
+    !ok_exposure              	~ paste0("< ", MIN_EXP_DAYS, " valid days in exposure window"),
+    !ok_reference             	~ paste0("< ", MIN_REF_DAYS, " valid days in reference window"),
+    !ok_prior_visit           	~ "No EHR visit in prior year",
+	case == 1 & !ok_has_control   ~ "No eligible control",
+	TRUE                      	~ "ok"))
+ 
+# Final cases and controls (risk sets whose case passed)
+eligible_members <- window_check |>
+  group_by(set_id) |>
+  filter(any(case == 1 & reason == "ok")) |>
+  ungroup() |>
+  filter(reason == "ok")
+ 
+# Table: window rules
+reason_order <- c(paste0("< ", MIN_EXP_DAYS, " valid days in exposure window"),
+                  paste0("< ", MIN_REF_DAYS, " valid days in reference window"),
+                  "No EHR visit in prior year",
+                  "No eligible control",
+                  "Included")
+ 
+window_check |>
+  mutate(Group  = ifelse(case == 1, "Cases", "Control candidates"),
+     	Reason = factor(ifelse(reason == "ok", "Included", reason), levels = reason_order)) |>
+  count(Group, Reason) |>
+  mutate(n = format(n, big.mark = ",")) |>
+  pivot_wider(names_from = Group, values_from = n, values_fill = "0") |>
+  viewer_table("Window rules: cases and control candidates")
+ 
+# Table: window settings (Methods)
+exposure_len  <- diff(EXP_WIN) + 1
+reference_len <- diff(REF_WIN) + 1
+tribble(
+  ~Setting,                     	~Value,
+  "Index date (day 0)",             "Admission date of first acute CVD hospitalization (controls: case's date)",
+  "Exposure window",                paste0("Days -", EXP_WIN[2], " to -", EXP_WIN[1], " (", exposure_len, " days)"),
+  "Gap before index",               paste0("Days -", EXP_WIN[1] - 1, " to -1 (not used)"),
+  "Reference window",               paste0("Days -", REF_WIN[2], " to -", REF_WIN[1], " (", reference_len, " days)"),
+  "Valid day",                      paste0("\u2265 ", MIN_STEPS, " steps and ", MIN_WEAR_MIN / 60, "-",
+                                           MAX_WEAR_MIN / 60, " h of heart-rate data"),
+  "Valid days, exposure window",    paste0("\u2265 ", MIN_EXP_DAYS, " of ", exposure_len, " (",
+                                           round(100 * MIN_EXP_DAYS / exposure_len), "%)"),
+  "Valid days, reference window",   paste0("\u2265 ", MIN_REF_DAYS, " of ", reference_len, " (",
+                                           round(100 * MIN_REF_DAYS / reference_len), "%)"),
+  "EHR encounter",                  paste0("\u2265 1 visit in the ", ENC_LOOKBACK, " days before day 0"),
+  "Controls: event-free period",    paste0("No acute CVD before day +", FREE_AFTER),
+  "Controls sampled per risk set",  paste0("Up to ", N_CAND)
+) |>
+  viewer_table("Window settings")
+ 
+# Table: cases by valid days in the exposure window
+window_check |>
+  filter(case == 1) |>
+  mutate(`Exposure valid days` = cut(exposure_days, c(-1, 0, 5, 11, 14, 17, 23, exposure_len),
+                                 	labels = c("0", "1-5", "6-11", "12-14", "15-17",
+                                                "18-23", "24"))) |>
+  count(`Exposure valid days`, .drop = FALSE) |>
+  mutate(n = format(n, big.mark = ",")) |>
+  viewer_table("Cases: valid days in the exposure window")
+ 
+# Table: cases included under alternative thresholds
+threshold_grid <- expand.grid(min_exposure = c(8, 12, 15, 18, 24), min_reference = c(10, 20, 30))
+threshold_gridcases<-map2int(thresholdgridmin_exposure, threshold_grid$min_reference, \(e, r) {
+  window_check |>
+    mutate(ok_rule = exposure_days >= e & reference_days >= r & prior_visits >= 1) |>
+    group_by(set_id) |>
+    summarise(keep = any(case == 1 & ok_rule) & any(case == 0 & ok_rule), .groups = "drop") |>
+	pull(keep) |>
+	sum()
+})
+ 
+threshold_grid |>
+  mutate(cases     	= format(cases, big.mark = ","),
+         min_exposure  = paste0("\u2265 ", min_exposure, " of ", exposure_len, " days",
+                                ifelse(min_exposure == MIN_EXP_DAYS, " (primary)", "")),
+         min_reference = paste0("Reference \u2265 ", min_reference, " of ", reference_len)) |>
+  pivot_wider(names_from = min_reference, values_from = cases) |>
+  rename(`Exposure window` = min_exposure) |>
+  viewer_table("Cases included under alternative valid-day thresholds")
+ 
+c(cases           = sum(eligible_members$case == 1),
+  controls    	= sum(eligible_members$case == 0),
+  control_people  = n_distinct(eligible_memberspersonid[eligiblememberscase == 0]))
+eligible_members |> filter(case == 0) |> count(set_id) |> pull(n) |> summary()
+ 
+ 
+ 
+# Figure 1. Sample selection flowchart (Plots)
+exclusion_text <- function(reasons) {
+  reasons <- reasons |> filter(n > 0)
+  paste0("Excluded (n = ", format(sum(reasons$n), big.mark = ","), ")\n",
+         paste0(reasonswhat,":",format(reasonsn, big.mark = ","), collapse = "\n"))
+}
+case_exclusions     <- window_check |> filter(case == 1, reason != "ok") |> count(what = reason)
+control_exclusions  <- window_check |>
+  filter(case == 0) |>
+  mutate(what = case_when(reason != "ok" ~ reason,
+                      	!member_id %in% eligible_members$member_id ~ "Their case was excluded")) |>
+  filter(!is.na(what)) |>
+  count(what)
+n_cases_included    <- sum(eligible_members$case == 1)
+n_controls_included <- sum(eligible_members$case == 0)
+ 
+boxes <- tribble(
+  ~x,   ~y,     ~w,  ~h,  ~type,  ~label,
+  0,	2,      4.4, 1.3, "main", paste0("All of Us participants\n(Controlled Tier v9)\nn = ", format(flow$n[1], big.mark = ",")),
+  0,	0,      4.4, 1.3, "main", paste0("Participants with Fitbit data\nn = ", format(flow$n[2], big.mark = ",")),
+  0,   -2,      4.4, 1.3, "main", paste0("≥ 1 valid Fitbit day\n(any date)\nn = ", format(flow$n[3], big.mark = ",")),
+  0,   -4,      4.4, 1.3, "main", paste0("Linked EHR data\nn = ", format(flow$n[4], big.mark = ",")),
+  0,   -6,      4.4, 1.3, "main", paste0("Study population: no CVD\nbefore Fitbit start\nn = ", format(flow$n[5], big.mark = ",")),
+  5.2,  1,      5.2, 1.0, "excl", paste0("Excluded: no Fitbit data\nn = ", format(flown[1]-flown[2], big.mark = ",")),
+  5.2, -1,  	5.2, 1.0, "excl", paste0("Excluded: no valid Fitbit day\n(any date)\nn = ", format(flown[2]-flown[3], big.mark = ",")),
+  5.2, -3,  	5.2, 1.0, "excl", paste0("Excluded: no EHR data\nn = ", format(flown[3]-flown[4], big.mark = ",")),
+  5.2, -5,  	5.2, 1.0, "excl", paste0("Excluded: CVD before Fitbit start\nn = ", format(flown[4]-flown[5], big.mark = ",")),
+  -3.5, -8, 	4.4, 1.3, "main", paste0("First acute CVD hospitalization\n(inpatient / ER-to-inpatient)\nn = ",
+                                         format(case_flow[["hospitalized"]], big.mark = ",")),
+  -3.5, -10.5,  4.4, 1.3, "main", paste0("Eligible cases\nn = ", format(case_flow[["adult"]], big.mark = ",")),
+  -3.5, -13,	4.4, 1.3, "main", paste0("Cases included\nn = ", format(n_cases_included, big.mark = ",")),
+  -9.6, -9.25,  6.6, 1.9, "excl", exclusion_text(tibble(
+	what = c("Index date before Fitbit start or after cutoff", "Earlier acute CVD code", "Age < 18"),
+	n	= c(case_flow[["hospitalized"]] - case_flow[["study_period"]],
+             case_flow[["study_period"]] - case_flow[["first_event"]],
+             case_flow[["first_event"]]  - case_flow[["adult"]]))),
+  -9.6, -11.75, 6.6, 1.9, "excl", exclusion_text(case_exclusions),
+  3.5, -8,  	4.4, 1.3, "main", paste0("Risk-set controls sampled\n(up to ", N_CAND, " per case)\nn = ",
+                                         format(nrow(control_candidates), big.mark = ",")),
+  3.5, -13, 	4.4, 1.3, "main", paste0("Controls included\nn = ", format(n_controls_included, big.mark = ","), " (",
+                                         format(n_distinct(eligible_memberspersonid[eligiblememberscase == 0]), big.mark = ","), " people)"),
+  9.6, -10.5,   6.6, 2.4, "excl", exclusion_text(control_exclusions)
+)
+ 
+arrows <- tribble(
+  ~x,	~y,     ~xend, ~yend,  ~head,
+  0, 	1.35,   0,  	0.65,  TRUE,
+  0, 	1,      2.6,	1, 	TRUE,
+  0,	-0.65,   0, 	-1.35,  TRUE,
+  0,	-2.65,   0, 	-3.35,  TRUE,
+  0,	-4.65,   0, 	-5.35,  TRUE,
+  0,	-1,      2.6,   -1, 	TRUE,
+  0,	-3,      2.6,   -3, 	TRUE,
+  0,	-5,      2.6,   -5, 	TRUE,
+  0,	-6.65,   0, 	-7, 	FALSE,
+  -3.5, -7,  	3.5,   -7, 	FALSE,
+  -3.5, -7, 	-3.5,   -7.35,  TRUE,
+  3.5,  -7,      3.5,   -7.35,  TRUE,
+  -3.5, -8.65,  -3.5,   -9.85,  TRUE,
+  -3.5, -11.15, -3.5,  -12.35,  TRUE,
+  -3.5, -9.25,  -6.3,   -9.25,  TRUE,
+  -3.5, -11.75, -6.3,  -11.75,  TRUE,
+  3.5,  -8.65,   3.5,  -12.35,  TRUE,
+  3.5,  -10.5,   6.3,  -10.5,   TRUE,
+  -1.3, -13, 	1.3,  -13, 	FALSE
+)
+ 
+ggplot() +
+  geom_segment(data = filter(arrows, head), aes(x, y, xend = xend, yend = yend),
+               arrow = arrow(length = unit(2, "mm"), type = "closed")) +
+  geom_segment(data = filter(arrows, !head), aes(x, y, xend = xend, yend = yend),
+               linetype = "dashed") +
+  geom_rect(data = boxes, aes(xmin = x - w / 2, xmax = x + w / 2,
+                          	ymin = y - h / 2, ymax = y + h / 2, fill = type),
+            colour = "black", linewidth = 0.4) +
+  geom_text(data = boxes, aes(x, y, label = label), size = 2.9, lineheight = 0.95) +
+  annotate("text", x = 0, y = -12.6, label = "same\nindex date", size = 2.6) +
+  scale_fill_manual(values = c(main = "white", excl = "grey93"), guide = "none") +
+  coord_fixed(clip = "off") +
+  theme_void()
+ 
+ 
+# Figure 2. Timeline of data collection (Plots)
+tl <- tribble(
+  ~row,  	~start,   	~end,     	~what,
+  "Case",    -REF_WIN[2],  -REF_WIN[1],  "Reference window",
+  "Case",    -EXP_WIN[2],  -EXP_WIN[1],  "Exposure window",
+  "Case",	-6,       	-1,       	"Not used",
+  "Control", -REF_WIN[2],  -REF_WIN[1],  "Reference window",
+  "Control", -EXP_WIN[2],  -EXP_WIN[1],  "Exposure window",
+  "Control", -6,           -1,       	"Not used",
+  "Control", 0,            FREE_AFTER,   "Event-free follow-up"
+) |>
+  mutate(y = ifelse(row == "Case", 2, 1),
+     	label = ifelse(what == "Not used", "",
+                        paste0(what, "\n(day ", start, " to ", ifelse(end > 0, "+", ""), end, ")")))
+ 
+ggplot(tl) +
+  geom_rect(aes(xmin = start, xmax = end + 1, ymin = y - 0.28, ymax = y + 0.28, fill = what),
+            colour = "white") +
+  geom_text(aes(x = (start + end + 1) / 2, y = y, label = label), size = 3, lineheight = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  annotate("point", x = 0, y = 2, shape = 23, size = 4, fill = "#CB181D") +
+  annotate("point", x = 0, y = 1, shape = 23, size = 4, fill = "white") +
+  annotate("text", x = 2, y = 2.45, hjust = 0, size = 3,
+       	label = "Day 0: first acute CVD hospitalization (index date)") +
+  annotate("text", x = 2, y = 1.45, hjust = 0, size = 3,
+       	label = "Day 0: case's index date (risk-set sampling)") +
+  annotate("segment", x = -118, xend = -1, y = 2.95, yend = 2.95,
+       	arrow = arrow(length = unit(2, "mm"), type = "closed")) +
+  annotate("text", x = -118, y = 3.2, hjust = 0, size = 3,
+       	label = "EHR visit in prior year; covariates before index | prior CVD assessed before Fitbit start") +
+  scale_fill_manual(values = c("Reference window" = "#9ECAE1", "Exposure window" = "#FDAE6B",
+                           	"Not used" = "grey85", "Event-free follow-up" = "#A1D99B"),
+                    guide = "none") +
+  scale_x_continuous(breaks = c(-REF_WIN[2], -REF_WIN[1], -EXP_WIN[1], 0, FREE_AFTER),
+                     labels = c(-REF_WIN[2], -REF_WIN[1], -EXP_WIN[1], 0, paste0("+", FREE_AFTER)),
+                     limits = c(-120, 100)) +
+  scale_y_continuous(breaks = 1:2, labels = c("Control", "Case"), limits = c(0.6, 3.35)) +
+  labs(x = "Days relative to index date", y = NULL,
+   	caption = paste0("Valid Fitbit day: ≥ ", MIN_STEPS, " steps and 10-24 h of heart-rate data; ",
+                        "≥ ", MIN_EXP_DAYS, " valid days in exposure and ≥ ",
+                        MIN_REF_DAYS, " in reference window")) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_text(face = "bold", size = 11),
+        axis.line.x = element_line())
+
